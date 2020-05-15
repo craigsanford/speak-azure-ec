@@ -1,0 +1,243 @@
+
+# Description
+# ============
+# This playbook creates a network interface where using virtual network in another resource group
+---
+- hosts: localhost
+  vars:
+    resource_group: SEDemo
+    location: eastus2
+    vnet_name: SEDemovnet 
+    ecv_name: AnsibleAzure
+    wan_subnet_name: wan0subnet 
+    lan_subnet_name: lan0subnet
+    wan0_nic_name: "{{ ecv_name }}wan0nic"
+    wan0_ip: 10.33.0.10
+    wan0_nh: 10.33.0.1
+    lan0_nic_name: "{{ ecv_name }}lan0nic" 
+    lan0_ip: 10.33.1.10
+    lan0_nh: 10.33.1.1
+
+#  roles:
+#    - azure.azure_preview_modules
+  tasks:
+
+    - name: Create RG
+      azure_rm_resourcegroup:
+        name: "{{ resource_group }}"
+        location: "{{ location }}"
+
+    - name: Create virtual network
+      azure_rm_virtualnetwork:
+         resource_group: "{{ resource_group }}"
+         name: "{{ vnet_name }}"
+         address_prefixes: "10.33.0.0/16"
+      register: vn
+
+    - name: Add subnet
+      azure_rm_subnet:
+        resource_group: "{{ resource_group }}"
+        name: "{{ wan_subnet_name }}"
+        address_prefix: "10.33.0.0/24"
+        virtual_network: "{{ vnet_name }}"
+
+    - name: Add subnet
+      azure_rm_subnet:
+        resource_group: "{{ resource_group }}"
+        name: "{{ lan_subnet_name }}"
+        address_prefix: "10.33.1.0/24"
+        virtual_network: "{{ vnet_name }}"
+
+    - name: Create WAN NIC
+      azure_rm_networkinterface:
+        resource_group: "{{ resource_group }}"
+        name: "{{ wan0_nic_name }}"
+        virtual_network: "{{ vnet_name }}"
+        subnet: "{{ wan_subnet_name }}"
+        #security_group: "{{ subnet_name }}"
+        enable_accelerated_networking: yes
+        ip_configurations:
+          - name: ipconfig1
+            private_ip_address: "{{ wan0_ip }}" 
+            private_ip_allocation_method: Static
+            primary: yes  
+
+    - name: Create LAN NIC
+      azure_rm_networkinterface:
+        resource_group: "{{ resource_group }}"
+        name: "{{ lan0_nic_name }}"
+        virtual_network: "{{ vnet_name }}"
+        subnet: "{{ lan_subnet_name }}"
+        #security_group: "{{ subnet_name }}"
+        enable_accelerated_networking: yes
+        enable_ip_forwarding: yes
+        ip_configurations:
+          - name: ipconfig1
+            private_ip_address: "{{ lan0_ip }}"
+            primary: yes
+            private_ip_allocation_method: Static
+
+    - name: Create a VM
+      azure_rm_virtualmachine:
+        resource_group: "{{ resource_group }}"
+        name: "{{ ecv_name }}"
+#        name: AnsibleAzure 
+        admin_username: craig 
+        ssh_password_enabled: no
+        ssh_public_keys:
+          - path: /home/craig/.ssh/authorized_keys
+            key_data: ssh-rsa AAAAB3NzaC1yc2EAAAABJQAAAQEAkky4fOioz+/XMcfRETPNYQujVZDXWspHaeriSjfE1W/geA2C4aGX7a9dgZ5k0XdH/vjKAyATp2nUSO+UND3XhynxLBZUofbUYZoR+h/ksiTpzL0pe/rcX926HO6PIWtKBoMfH+viebECjcFlxVVv0ttLeFA8ymYzXS7e43LjvoT1UJHUVGrVQ7e2BBDevedYi8G/fSRs377ptsB5D61YeUrtRvzRov9IJ/3emBtW2Td0fjSxEEqzftT82CLH6QXSmw8m+Djln/QueD3khMAWch1Z884dhOx2EiwP4zurymlqp6OCrv2/EAVvm5z9woAyNVQSMqeq73bN6rqIEHkB1Q== rsa-key-20190806 
+        vm_size: Standard_DS3_v2 
+        image:
+          publisher: silver-peak-systems 
+          offer: silver_peak_edgeconnect 
+          sku: silver_peak_edgeconnect_8_1_9_4 
+          version: latest
+        plan:
+          publisher: silver-peak-systems
+          product: silver_peak_edgeconnect
+          name: silver_peak_edgeconnect_8_1_9_4 
+
+    - name: Deallocate
+      azure_rm_virtualmachine:
+        resource_group: "{{ resource_group }}"
+        name: "{{ ecv_name }}"
+        allocated: no
+      tags: reboot
+
+    - name: Update VM to have multiple NICs 
+      azure_rm_virtualmachine:
+        resource_group: "{{ resource_group }}"
+        name: "{{ ecv_name }}"
+        network_interface_names:
+          - "{{ ecv_name }}01"
+          - "{{ wan0_nic_name }}"
+          - "{{ lan0_nic_name }}"
+
+    - name: Power On
+      azure_rm_virtualmachine:
+        resource_group: "{{ resource_group }}" 
+        name: "{{ ecv_name }}" 
+      tags: reboot
+
+    - name: Get VM facts
+      azure_rm_virtualmachine_facts:
+        resource_group: "{{ resource_group }}"
+        name: AnsibleAzure
+      register: ecv
+
+    - name: Get wan0 facts
+      azure_rm_networkinterface_facts:
+        resource_group: "{{ resource_group }}"
+        name: "{{ wan0_nic_name }}"  
+      register: wan0
+
+    - name: Get lan0 facts
+      azure_rm_networkinterface_facts:
+        resource_group: "{{ resource_group }}"
+        name: "{{ lan0_nic_name }}"
+      register: lan0
+
+    - name: Convert wan0 to proper format 
+      debug:
+        msg: "{{ wan0.networkinterfaces[0].mac_address | regex_replace('-',':') }}"
+      register: wan0_mac
+
+    - name: Convert lan0 to proper format
+      debug:
+        msg: "{{ lan0.networkinterfaces[0].mac_address | regex_replace('-',':') }}"
+      register: lan0_mac
+
+    - name: Update NSG
+      azure_rm_securitygroup:
+        resource_group: "{{ resource_group }}"
+        name: "{{ ecv.vms[0].tags._own_nsg_ }}"
+        purge_rules: yes
+        rules:
+          - name: AllowHTTPSFromCorp
+            protocol: Tcp
+            source_address_prefix: '64.13.147.138/32'
+            destination_port_range: 443 
+            access: Allow
+            priority: 102
+            direction: Inbound
+          - name: AllowSSHFromHome
+            source_address_prefix: '64.13.147.138/32'
+            protocol: Tcp
+            destination_port_range: 22
+            access: Allow
+            priority: 110
+            direction: Inbound
+
+    - name: Find Public IP 
+      azure_rm_publicipaddress_facts:
+        resource_group: "{{ resource_group }}"
+        name: "{{ ecv.vms[0].tags._own_pip_ }}"
+      register: pip
+
+
+    - name: Display Public IP
+      debug:
+        msg: "The Public IP is {{ pip.publicipaddresses[0].ip_address }}" 
+
+    - name: Pause for username change - UGLY
+      pause:
+        minutes: 20
+
+    - name: Login
+      uri:
+        validate_certs: no
+        url:  "https://{{ pip.publicipaddresses[0].ip_address }}/rest/json/login"
+        body: {"user": "admin", "password": "Password1!"}
+        body_format: json
+        return_content: yes
+        method: POST
+        headers:
+          Content-Type: "application/json"
+      register: ecv_host
+
+    - name: Account Information
+      uri:
+        validate_certs: no
+        url: "https://{{ pip.publicipaddresses[0].ip_address }}/rest/json/spPortal/register"
+#        body: {"accountKey": "bSzH8Y1Vv33jqXmfFmhnk5pxpavvgkOS", "account":"Silver Peak SE - Craig Sanford", "site":"azure"}
+        body: {"accountKey": "o72Jm3CykaanU6s1o2YJdRbkBgBApTN4", "account":"Silver Peak SE – Lab Account 1", "site":"azure"}
+        body_format: json
+        return_content: yes
+        method: POST
+        headers:
+          Content-Type: "application/json"
+          Cookie: "{{ ecv_host.set_cookie }}"
+
+    - name: Map MAC addresses 
+      uri:
+        validate_certs: no
+        url: "https://{{ pip.publicipaddresses[0].ip_address }}/rest/json/cliMultiple"
+        body: {"commands": ["interface wan0 mac address {{ wan0_mac.msg }}", "interface lan0 mac address {{ lan0_mac.msg }}", "wr mem"]}
+        body_format: json
+        return_content: yes
+        method: POST
+        headers:
+          Content-Type: "application/json"
+          Cookie: "{{ ecv_host.set_cookie }}"
+
+    - name: Change Deployment and Reboot
+      uri:
+        validate_certs: no
+        url: "https://{{ pip.publicipaddresses[0].ip_address }}/rest/json/deployment"
+        status_code: [200,202]
+        body_format: json
+        return_content: yes
+        method: POST
+        headers:
+          Content-Type: "application/json"
+          Cookie: "{{ ecv_host.set_cookie }}"
+        body: {"sysConfig":{"mode":"router","bonding":false,"tenG":false,"maxBW":"100000","maxInBWEnabled":false,"maxInBW":"100000","useMgmt0":false,"propagateLinkDown":false,"singleBridge":false,"inline":true},"modeIfs":[{"devNum":"rtr2","ifName":"lan0","ifSide":"lan","applianceIPs":[{"ip":"{{ lan0_ip }}","mask":"24","subif":null,"wanNexthop":"{{ lan0_nh }}","wanSide":false,"lanSide":true,"dhcp":false,"harden":0,"behindNAT":"none","label":"","maxBW":{},"zone":0,"comment":""}]},{"devNum":"rtr1","ifName":"wan0","ifSide":"wan","applianceIPs":[{"ip":"{{ wan0_ip }}","mask":"24","subif":null,"wanNexthop":"{{ wan0_nh }}","wanSide":true,"lanSide":false,"dhcp":false,"harden":0,"behindNAT":"auto","label":"","maxBW":{"inbound":"100000","outbound":"100000"},"zone":0,"comment":""}]}],"dpRoutes":[],"reboot":{"reboot_type":"Normal","save_db":true,"clear_nm":false,"next_partition":false,"empty_db":false,"empty_db_err":false,"delay":0}}
+#Move EIP over?
+      tags: reboot
+
+
+
+
+
+ 
